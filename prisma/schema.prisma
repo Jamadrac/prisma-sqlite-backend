@@ -1,0 +1,11 @@
+model Article {
+  id        Int      @id @default(autoincrement())
+  title     String
+  content   String
+  category  String
+  author    String
+  date      DateTime
+  town      String
+  year      Int
+  createdAt DateTime @default(now())
+}
