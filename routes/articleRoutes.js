@@ -6,7 +6,7 @@ const router = express.Router();
 const prisma = new PrismaClient();
 
 // Create a new article
-router.post("/", async (req, res) => {
+router.post("/post", async (req, res) => {
   // Change "/post" to "/"
   try {
     const { title, content, category, author, date, town, year } = req.body;
