@@ -30,7 +30,7 @@ app.use(bodyParser.urlencoded({ extended: true }));
 
 // Mount the article routes with '/articles' path
 app.use("/articles", articleRoutes);
-// app.use("auth", auth);
+app.use("/auth", auth);
 
 app.listen(PORT, () => {
   console.log(`Server is running on http://localhost:${PORT}`);

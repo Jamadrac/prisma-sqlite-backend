@@ -1,195 +1,219 @@
-// auth.js
+const express = require("express");
 const { PrismaClient } = require("@prisma/client");
-const nodemailer = require("nodemailer");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
+const nodemailer = require("nodemailer");
+const crypto = require("crypto");
 
+const router = express.Router();
 const prisma = new PrismaClient();
 
-// Configure nodemailer
+// Configuration
+const config = {
+  jwt: {
+    secret: "your_jwt_secret", // Replace with a strong secret key
+    expiresIn: "1h",
+    algorithm: "HS256",
+  },
+  email: {
+    service: "Gmail",
+    user: "your-email@gmail.com",
+    password: "your-email-password",
+  },
+  security: {
+    bcryptRounds: 10,
+    otpExpiryTime: 10 * 60 * 1000, // 10 minutes in milliseconds
+    passwordRegex: /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)[A-Za-z\d@$!%*?&]{8,}$/,
+  },
+};
+
+// Mailer setup
 const transporter = nodemailer.createTransport({
-  service: "gmail",
+  service: config.email.service,
   auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASSWORD,
+    user: config.email.user,
+    pass: config.email.password,
   },
 });
 
-// User model extension for Prisma schema
-/*
-model User {
-  id            Int      @id @default(autoincrement())
-  email         String   @unique
-  password      String
-  profileImage  String?  // Base64 string
-  resetToken    String?
-  resetTokenExp DateTime?
-  otp          String?
-  otpExp       DateTime?
-  createdAt    DateTime @default(now())
-}
-*/
+// Helper for OTP attempts rate-limiting
+const otpAttempts = new Map();
 
-class AuthService {
-  // Register new user
-  async register(email, password, profileImage) {
-    try {
-      const existingUser = await prisma.user.findUnique({ where: { email } });
-      if (existingUser) {
-        throw new Error("User already exists");
-      }
-
-      const hashedPassword = await bcrypt.hash(password, 10);
-
-      const user = await prisma.user.create({
-        data: {
-          email,
-          password: hashedPassword,
-          profileImage: profileImage, // Base64 string
-        },
-      });
-
-      return { message: "User registered successfully", userId: user.id };
-    } catch (error) {
-      throw error;
-    }
+// Helper Functions
+const isStrongPassword = (password) =>
+  config.security.passwordRegex.test(password);
+const isRateLimited = (key, attemptsMap) => {
+  const attempts = attemptsMap.get(key) || { count: 0, timestamp: Date.now() };
+  if (
+    attempts.count >= 3 &&
+    Date.now() - attempts.timestamp < config.security.otpExpiryTime
+  ) {
+    return true;
   }
+  return false;
+};
 
-  // Login user
-  async login(email, password) {
-    try {
-      const user = await prisma.user.findUnique({ where: { email } });
-      if (!user) {
-        throw new Error("User not found");
-      }
+const incrementAttempts = (key, attemptsMap) => {
+  const attempts = attemptsMap.get(key) || { count: 0, timestamp: Date.now() };
+  attempts.count++;
+  if (attempts.count === 1) attempts.timestamp = Date.now();
+  attemptsMap.set(key, attempts);
+};
 
-      const isValidPassword = await bcrypt.compare(password, user.password);
-      if (!isValidPassword) {
-        throw new Error("Invalid password");
-      }
+// Routes
+router.post("/register", async (req, res) => {
+  try {
+    const { email, password, profileImage } = req.body;
 
-      const token = jwt.sign(
-        { userId: user.id, email: user.email },
-        process.env.JWT_SECRET,
-        { expiresIn: "24h" }
-      );
-
-      return { token, userId: user.id };
-    } catch (error) {
-      throw error;
+    if (!isStrongPassword(password)) {
+      throw new Error("Password does not meet security requirements");
     }
-  }
 
-  // Generate and send OTP for password reset
-  async forgotPassword(email) {
-    try {
-      const user = await prisma.user.findUnique({ where: { email } });
-      if (!user) {
-        throw new Error("User not found");
-      }
-
-      // Generate 6-digit OTP
-      const otp = Math.floor(100000 + Math.random() * 900000).toString();
-      const otpExpiry = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes validity
-
-      // Save OTP and expiry in database
-      await prisma.user.update({
-        where: { email },
-        data: {
-          otp,
-          otpExp: otpExpiry,
-        },
-      });
-
-      // Send email with OTP
-      const mailOptions = {
-        from: process.env.EMAIL_USER,
-        to: email,
-        subject: "Password Reset OTP",
-        html: `
-          <h1>Password Reset Request</h1>
-          <p>Your OTP for password reset is: <strong>${otp}</strong></p>
-          <p>This OTP will expire in 15 minutes.</p>
-          <p>If you didn't request this, please ignore this email.</p>
-        `,
-      };
-
-      await transporter.sendMail(mailOptions);
-      return { message: "OTP sent successfully" };
-    } catch (error) {
-      throw error;
+    const existingUser = await prisma.user.findUnique({ where: { email } });
+    if (existingUser) {
+      throw new Error("User already exists");
     }
+
+    const hashedPassword = await bcrypt.hash(
+      password,
+      config.security.bcryptRounds
+    );
+
+    const user = await prisma.user.create({
+      data: {
+        email,
+        password: hashedPassword,
+        profileImage, // Assuming you're passing a valid image string
+      },
+    });
+
+    res
+      .status(201)
+      .json({ message: "User registered successfully", userId: user.id });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
   }
+});
 
-  // Verify OTP and update password
-  async resetPassword(email, otp, newPassword) {
-    try {
-      const user = await prisma.user.findUnique({ where: { email } });
-      if (!user) {
-        throw new Error("User not found");
-      }
+router.post("/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
 
-      if (!user.otp || !user.otpExp) {
-        throw new Error("No OTP request found");
-      }
-
-      if (user.otp !== otp) {
-        throw new Error("Invalid OTP");
-      }
-
-      if (new Date() > user.otpExp) {
-        throw new Error("OTP has expired");
-      }
-
-      const hashedPassword = await bcrypt.hash(newPassword, 10);
-
-      // Update password and clear OTP fields
-      await prisma.user.update({
-        where: { email },
-        data: {
-          password: hashedPassword,
-          otp: null,
-          otpExp: null,
-        },
-      });
-
-      return { message: "Password updated successfully" };
-    } catch (error) {
-      throw error;
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user || !(await bcrypt.compare(password, user.password))) {
+      throw new Error("Invalid credentials");
     }
+
+    const token = jwt.sign(
+      { userId: user.id, email: user.email },
+      config.jwt.secret,
+      { expiresIn: config.jwt.expiresIn, algorithm: config.jwt.algorithm }
+    );
+
+    res.status(200).json({ token, userId: user.id });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
   }
+});
 
-  // Update profile image
-  async updateProfileImage(userId, imageBase64) {
-    try {
-      await prisma.user.update({
-        where: { id: userId },
-        data: {
-          profileImage: imageBase64,
-        },
-      });
+router.post("/forgot-password", async (req, res) => {
+  try {
+    const { email } = req.body;
 
-      return { message: "Profile image updated successfully" };
-    } catch (error) {
-      throw error;
+    if (isRateLimited(email, otpAttempts)) {
+      throw new Error("Too many OTP requests. Try again later.");
     }
-  }
 
-  // Middleware to verify JWT token
-  verifyToken(req, res, next) {
-    try {
-      const token = req.headers.authorization?.split(" ")[1];
-      if (!token) {
-        throw new Error("No token provided");
-      }
-
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      req.user = decoded;
-      next();
-    } catch (error) {
-      res.status(401).json({ error: "Invalid token" });
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user) {
+      res
+        .status(200)
+        .json({ message: "If the user exists, OTP has been sent." });
+      return;
     }
-  }
-}
 
-module.exports = new AuthService();
+    const otp = crypto.randomInt(100000, 999999).toString();
+    const otpExpiry = new Date(Date.now() + config.security.otpExpiryTime);
+
+    await prisma.user.update({
+      where: { email },
+      data: {
+        otp: await bcrypt.hash(otp, config.security.bcryptRounds),
+        otpExp: otpExpiry,
+      },
+    });
+
+    const mailOptions = {
+      from: config.email.user,
+      to: email,
+      subject: "Password Reset OTP",
+      html: `<p>Your OTP for password reset is: <strong>${otp}</strong></p><p>This OTP will expire in 10 minutes.</p>`,
+    };
+
+    await transporter.sendMail(mailOptions);
+
+    res.status(200).json({ message: "If the user exists, OTP has been sent." });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+router.post("/reset-password", async (req, res) => {
+  try {
+    const { email, otp, newPassword } = req.body;
+
+    if (!isStrongPassword(newPassword)) {
+      throw new Error("Password does not meet security requirements");
+    }
+
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user || !user.otp || !user.otpExp || new Date() > user.otpExp) {
+      throw new Error("Invalid or expired reset request");
+    }
+
+    const isValidOTP = await bcrypt.compare(otp, user.otp);
+    if (!isValidOTP) {
+      throw new Error("Invalid or expired reset request");
+    }
+
+    const hashedPassword = await bcrypt.hash(
+      newPassword,
+      config.security.bcryptRounds
+    );
+
+    await prisma.user.update({
+      where: { email },
+      data: {
+        password: hashedPassword,
+        otp: null,
+        otpExp: null,
+      },
+    });
+
+    res.status(200).json({ message: "Password updated successfully" });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+router.get("/protected", async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(" ")[1];
+    if (!token) {
+      throw new Error("No token provided");
+    }
+
+    const decoded = jwt.verify(token, config.jwt.secret, {
+      algorithms: [config.jwt.algorithm],
+    });
+
+    res
+      .status(200)
+      .json({ message: "This is a protected route", user: decoded });
+  } catch (error) {
+    res.status(401).json({ error: error.message });
+  }
+});
+
+// Export the router
+module.exports = router;
